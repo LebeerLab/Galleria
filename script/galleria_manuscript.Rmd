@@ -1,0 +1,332 @@
+---
+title: "Galleria manuscript"
+author: "Wannes Van Beeck"
+date: "02 April 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidyamplicons)
+library(dplyr)
+
+
+```
+
+## import of data
+
+```{r}
+#jervis-bardy script
+
+add_jervis_bardy <- function(ta, dna_conc, sample_condition = NULL, min_pres = 3) {
+  
+  dna_conc <- enquo(dna_conc)
+  sample_condition <- enquo(sample_condition)
+  
+  if (! is.null(sample_condition)) {
+    ta <- ta %>%
+      filter_samples(!! sample_condition)
+  }
+  
+  # if rel_abundance not present: add and remove on exit
+  if (! "rel_abundance" %in% names(ta$abundances)) {
+    ta <- add_rel_abundance(ta)
+    on.exit(ta$abundances$rel_abundance <- NULL)
+  }
+  
+  # perform jervis bardy calculation
+  taxa_jb <- ta$abundances %>%
+    left_join(ta$samples %>% select(sample_id, dna_conc = !! dna_conc)) %>%
+    group_by(taxon_id) %>%
+    filter(n() >= !! min_pres) %>%
+    do(jb = cor.test(x = .$rel_abundance, y = .$dna_conc, alternative = "less", method = "spearman")) %>%
+    mutate(jb_cor = jb$estimate, jb_p = jb$p.value) %>%
+    select(- jb)
+  
+  # add jb_p and jb_cor to taxa table
+  ta$taxa <- left_join(ta$taxa, taxa_jb)
+  
+  # return ta object
+  ta
+  
+}
+
+
+```
+```{r}
+#function that imputs layout for figures.
+theme_pub<-function (base_size = 12, base_family = "") {
+  
+  theme_grey(base_size = base_size, 
+             base_family = base_family) %+replace% 
+    
+    theme(# Set text size
+      plot.title = element_text(size = 14,face="bold",margin=margin(0,0,5,0)),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = 10, 
+                                  angle = 90),
+      
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size = 12),
+      
+      strip.text.x = element_text(size =12,face = "bold",margin=margin(0,0,5,0)),
+      strip.text.y = element_text(size = 15,
+                                  angle = -90),
+      
+      # Legend size and text
+      legend.title = element_blank(),
+      legend.text = element_text(size = 8),
+      legend.key.size =  unit(0.5, "cm"),
+      
+      # Configure lines and axes
+      axis.ticks.x = element_blank(), 
+      axis.ticks.y = element_line(colour = "black"), 
+      
+      # Plot background
+      panel.background = element_rect(fill = "transparent"),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      
+      # Facet labels        
+      legend.key = element_rect(colour = "grey80"), 
+      strip.background = element_blank())
+}
+```
+
+
+```{r cars}
+#load in data
+load("galleria.robject")
+galleria<-run
+get_numbers(galleria)
+
+#split out the metadata that is hidden inside the name of the samples
+galleria$samples <- galleria$samples %>%
+    separate(description,into = c("run","type","number","location"),remove = F)
+
+galleria<-add_lib_size(galleria)
+
+galleria$samples %>%
+  group_by(type,location) %>%
+  mutate(avg_lib=mean(lib_size)) %>%
+  ggplot(aes(x=location,y=avg_lib))+
+  geom_boxplot()+
+  facet_wrap(~type)+
+  theme_pub()
+
+ggplot(galleria$samples,aes(x=location,y=lib_size))+
+  geom_jitter()+
+  facet_wrap(~type,scales= "free")
+
+```
+
+## quality control
+
+```{r}
+run<-galleria
+
+run$taxa <- run$taxa %>%
+  mutate(length = str_length(taxon_id))
+run$taxa %>%
+  count(length) %>%
+  rename(n_asvs = n) %>%
+  ggplot(aes(x = length, y = n_asvs)) +
+  geom_bar(stat = "identity") +
+  scale_y_log10()
+## filter out too long reads
+run$taxa <- run$taxa %>%
+  filter(length < 350) 
+run <- process_taxon_selection(run)
+run<- update_lib_sizes(run, step = "removing_too_long")
+
+#filter out non-bacterial reads
+run$taxa <- run$taxa %>%
+  filter(kingdom == "Bacteria") %>%
+  filter(class != "Chloroplast" | is.na(class)) %>%
+  filter(family != "Mitochondria" | is.na(family))
+run <- process_taxon_selection(run)
+run <- update_lib_sizes(run, step = "removing_non_bacterial")
+
+##jervis Bardy
+#load the pool-miseq data containing the amount of DNA added to the library
+
+library(readxl)
+pool_miseq <-read_excel("pool_miseq.xlsx")
+
+run$samples<-run$samples %>% 
+  left_join(pool_miseq)
+
+run<-filter_samples(run,!is.na(pool)) 
+
+run <- run %>%
+  add_lib_size() %>%
+  mutate_samples(dna_conc = ifelse(pool == 0 | is.na(pool), 0, lib_size / pool)) 
+
+run_low_conc <- filter_samples(run,dna_conc<15)
+
+run <- run %>%
+  add_jervis_bardy(dna_conc, sample_condition = dna_conc != 0)
+
+run$taxa %>%
+  ggplot(aes(x = jb_p)) +
+  geom_density(bw = 0.01) +
+  geom_rug ()
+
+
+run <- run %>%
+  add_taxon_name()
+run %>%
+  add_total_rel_abundance() %>%
+  select_taxa(taxon_id, taxon_name, jb_p, total_rel_abundance) %>%
+  pluck("taxa") %>%
+  arrange(jb_p) %>%
+  View()
+
+
+run_after_JB <- run %>%
+  tidyamplicons::filter_taxa(jb_p > 1e-5) %>%
+  update_lib_sizes(step = "jervis-bardy")
+run_after_JB$taxa %>% View()
+
+get_numbers(run_after_JB)
+
+#run_after_JB<- filter_samples(run_after_JB, lib_size >200)
+
+
+```
+
+
+```{r}
+## alternative DNA concentrations per location
+ggplot(run_after_JB$samples,aes(y=dna_conc,x=location))+
+  geom_boxplot()+
+  facet_wrap(~type,scales="free_x")
+```
+
+
+## diversity metrics
+
+```{r pressure, echo=FALSE}
+#change names to more publishable location names
+run_after_JB<-add_diversity_measures(run_after_JB)
+run_after_JB_kit<- filter_samples(run_after_JB,type == "KIT")
+run_after_JB<-filter_samples(run_after_JB,location != "NA")
+
+run_after_JB$samples$type <- str_replace(run_after_JB$samples$type, "LABO", "Research Grade" )
+run_after_JB$samples$type <- str_replace(run_after_JB$samples$type, "BAIT", "Bait Grade" )
+run_after_JB$samples$location <- str_replace(run_after_JB$samples$location, "G", "Gut" )
+run_after_JB$samples$location <- str_replace(run_after_JB$samples$location, "F", "Fatbody" )
+run_after_JB$samples$location <- str_replace(run_after_JB$samples$location, "H", "Haemolymph" )
+run_after_JB$samples$location <- str_replace(run_after_JB$samples$location, "S", "Skin" )
+run_after_JB$samples$location <- str_replace(run_after_JB$samples$location, "Gut", "Faeces")
+
+
+run_after_JB %>%
+  samples() %>%
+  group_by(location,type) %>%
+  summarize(mean(div_inv_simpson))
+
+#colours of boxplot figure 1: #66c2a5, #fc8d62, #8da0cb, #ffd966
+
+
+#we plot the inverse simpson index for all different locations by rerunning this part of the script and changing filter step of location
+
+run_after_JB_Faeces<-filter_samples(run_after_JB, location == "Faeces")
+
+
+ggplot(run_after_JB_Faeces$samples,aes(x=type,y=div_inv_simpson))+
+  geom_boxplot(aes(fill=location), fill= "#ffd966", lwd = 1)+
+  geom_point(size= 1, alpha=0.5)+
+  ylab("Inverse Simpson index")+
+  theme_pub()+
+  scale_y_continuous(limits = c(0, 20))+
+  theme(
+    axis.text.x = element_text(size=30),
+    axis.text.y=element_text(size=25),
+    axis.title.y= element_text(size=30)
+  )
+
+#ggsave("C:/Users/vanbe/Documents/boxplot_figure1_faeces_new.png",width = 10, height = 7)
+
+
+```
+
+## community plots
+
+lets look at the overall community
+
+```{r}
+#we filter out common kit contaminants based on https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4228153/ 
+run_after_JB<-run_after_JB %>%
+  filter_taxa(genus != "Bradyrhizobium") %>%
+  filter_taxa(genus != "Paracoccus") %>%
+  filter_taxa(genus != "Sphingopyxis") %>%
+  filter_taxa(genus != "Neorhizobium")
+                         
+#check numbers after final clean-up
+get_numbers(run_after_JB)
+#check taxa present in the final object
+run_after_JB$taxa
+colours <- c("#a6cee3","#b2df8a","#33a02c","#fb9a99","#e31a1c","#fdbf6f","#1f78b4","#ff7f00","#cab2d6","#6a3d9a","#ffff99","#b15928","#756bb1","#dd1c77","#878787")
+
+# add colors for 15 taxa
+run_after_JB<- add_taxon_name_color(run_after_JB,n=15)
+
+panel_a<-get_bar_plot(run_after_JB)+
+  facet_wrap(~location~type,scales= "free",ncol=2) +
+  theme_pub()+
+  ggtitle("Microbiome of different body niches")+
+  scale_fill_manual(values=colours) 
+
+  panel_a$data %>%
+  filter(taxon_name_color != "residual")%>%
+  select(genus,species,taxon_name)%>% 
+  unique() %>%
+    View()
+
+
+```
+
+a lot of residual in the skin samples 
+
+lets take a look at what happends when we individually plot them out
+
+
+###skin
+
+
+```{r}
+#analysis of skin samples with non-bacterial taxa
+
+
+galleria$samples$type <- str_replace(galleria$samples$type, "LABO", "Research Grade" )
+galleria$samples$type <- str_replace(galleria$samples$type, "BAIT", "Bait Grade" )
+galleria$samples$location <- str_replace(galleria$samples$location, "S", "Skin" )
+
+#filter for skin samples
+galleria_skin <- galleria%>%
+  filter_samples(location == "Skin")
+
+galleria_skin<-add_taxon_name_color(galleria_skin,n=15)
+
+#get a bar plot
+
+panel_b<-get_bar_plot(galleria_skin) +
+  facet_wrap(~type,scales= "free")+
+    scale_fill_manual(values=colours)+
+  ggtitle("Skin microbiome containing non-bacterial members")+
+  theme_pub()+
+  theme(legend.key.size = unit(0.4,"cm"))
+
+
+```
+
+```{r}
+library(ggpubr)
+ggarrange(panel_a,panel_b,
+          labels= c("A", "B"),
+          ncol = 1, nrow = 2, heights =  c(2.5,1))
+```
+
+
